@@ -1,0 +1,245 @@
+#include <Trade\Trade.mqh>
+
+input group             "Gestão de Risco Dinâmica"
+input double   InpLots          = 1.0;
+input double   InpRiskFactor    = 1.5;
+input double   InpProfitFactor  = 3.0;
+
+input group             "Controlo Operacional"
+input int      InpCooldownMins  = 30;
+input double   InpThreshold     = 0.65;
+
+input group             "IA Deep Learning (M15/H1)"
+input int      InpHiddenNeurons = 12;  
+input double   InpLearningRate  = 0.005; 
+input bool     InpTrainMode     = false;
+input string   InpFileName      = "WIN_DEEP_V22_M15.bin";
+
+input group             "Filtros de Contexto"
+input ENUM_TIMEFRAMES InpMacroTF= PERIOD_H1;
+input int      InpMA_Period     = 200; 
+input int      InpATR_Period    = 14;  
+
+input group             "Horário"
+input string   InpStartTime     = "09:15";
+input string   InpEndTime       = "16:30";
+
+CTrade   trade;
+int      hRSI, hMA, hATR;
+double   W1[], B1[], W2[], B2[]; 
+bool     ai_ready = false;
+datetime last_trade_time = 0;
+
+double Tanh(double x) { return MathTanh(x); } 
+double Sigmoid(double x) { 
+   if(x < -10.0) return 0.0; if(x > 10.0) return 1.0;
+   return 1.0 / (1.0 + MathExp(-x)); 
+} 
+double TanhDeriv(double y) { return 1.0 - (y * y); } 
+double SigmoidDeriv(double y) { return y * (1.0 - y); }
+
+double Clip(double value, double limit=0.5) {
+   if(value > limit) return limit;
+   if(value < -limit) return -limit;
+   return value;
+}
+
+void InitNetwork(int inputs, int hidden, int outputs) {
+   ArrayResize(W1, inputs * hidden); ArrayResize(B1, hidden);
+   ArrayResize(W2, hidden * outputs); ArrayResize(B2, outputs);
+   
+   if(FileIsExist(InpFileName, FILE_COMMON) && !InpTrainMode) {
+      int h = FileOpen(InpFileName, FILE_READ|FILE_BIN|FILE_COMMON);
+      if(h != INVALID_HANDLE) {
+         FileReadArray(h, W1); FileReadArray(h, B1);
+         FileReadArray(h, W2); FileReadArray(h, B2);
+         FileClose(h);
+         Print(">>> V22: CÉREBRO MULTI-TIMEFRAME CARREGADO.");
+         ai_ready = true; return;
+      }
+   }
+   
+   Print(">>> V22: CRIANDO NOVO CÉREBRO.");
+   MathSrand(GetTickCount());
+   for(int i=0; i<ArraySize(W1); i++) W1[i] = (MathRand()/32767.0)*0.2-0.1;
+   for(int i=0; i<ArraySize(B1); i++) B1[i] = (MathRand()/32767.0)*0.2-0.1;
+   for(int i=0; i<ArraySize(W2); i++) W2[i] = (MathRand()/32767.0)*0.2-0.1;
+   for(int i=0; i<ArraySize(B2); i++) B2[i] = (MathRand()/32767.0)*0.2-0.1;
+   ai_ready = true;
+}
+
+void SaveNetwork() {
+   int h = FileOpen(InpFileName, FILE_WRITE|FILE_BIN|FILE_COMMON);
+   if(h != INVALID_HANDLE) {
+      FileWriteArray(h, W1); FileWriteArray(h, B1);
+      FileWriteArray(h, W2); FileWriteArray(h, B2);
+      FileClose(h);
+   }
+}
+
+double Compute(double &inputs[], double &hidden_outputs[]) {
+   int inp_count = 5, hid_count = InpHiddenNeurons;
+   ArrayResize(hidden_outputs, hid_count);
+   for(int h=0; h<hid_count; h++) {
+      double sum = B1[h];
+      for(int i=0; i<inp_count; i++) sum += inputs[i] * W1[i*hid_count + h];
+      hidden_outputs[h] = Tanh(sum); 
+   }
+   double sum_out = B2[0];
+   for(int h=0; h<hid_count; h++) sum_out += hidden_outputs[h] * W2[h];
+   return Sigmoid(sum_out); 
+}
+
+void TrainDeep(double &inputs[], double target) {
+   double hidden_outs[];
+   double output = Compute(inputs, hidden_outs);
+   double error = target - output;
+   double delta_out = Clip(error * SigmoidDeriv(output)); 
+   
+   int hid_count = InpHiddenNeurons;
+   double delta_hidden[]; ArrayResize(delta_hidden, hid_count);
+   for(int h=0; h<hid_count; h++) {
+      double error_h = delta_out * W2[h];
+      delta_hidden[h] = Clip(error_h * TanhDeriv(hidden_outs[h])); 
+   }
+   for(int h=0; h<hid_count; h++) W2[h] += InpLearningRate * delta_out * hidden_outs[h];
+   B2[0] += InpLearningRate * delta_out;
+   
+   int inp_count = ArraySize(inputs);
+   for(int i=0; i<inp_count; i++) {
+      for(int h=0; h<hid_count; h++) {
+         W1[i*hid_count + h] += InpLearningRate * delta_hidden[h] * inputs[i];
+      }
+   }
+   for(int h=0; h<hid_count; h++) B1[h] += InpLearningRate * delta_hidden[h];
+}
+
+bool GetFeatures(double &features[]) {
+   ArrayResize(features, 5);
+   
+   double c1 = iClose(_Symbol, _Period, 1);
+   double o1 = iOpen(_Symbol, _Period, 1);
+   features[0] = MathTanh((c1 - o1)/200.0); 
+   
+   double rsi[]; ArraySetAsSeries(rsi, true);
+   if(CopyBuffer(hRSI, 0, 1, 1, rsi)<1) return false;
+   features[1] = MathTanh((rsi[0] - 50.0)/25.0);
+   
+   double ma[]; ArraySetAsSeries(ma, true);
+   if(CopyBuffer(hMA, 0, 1, 1, ma)<1) return false;
+   features[2] = MathTanh((c1 - ma[0])/300.0);
+   
+   double atr[]; ArraySetAsSeries(atr, true);
+   if(CopyBuffer(hATR, 0, 1, 1, atr)<1) return false;
+   features[3] = MathTanh((atr[0] - 150.0)/150.0);
+   
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   features[4] = (dt.hour - 13.0) / 4.0;
+   
+   return true;
+}
+
+bool IsTradingTime() {
+   datetime now = TimeCurrent();
+   MqlDateTime s; TimeToStruct(now, s);
+   int t = s.hour*60 + s.min;
+   if(t >= 720 && t < 780) return false;
+   return (t >= 555 && t < 990);
+}
+
+int OnInit() {
+   trade.SetExpertMagicNumber(2222);
+   trade.SetDeviationInPoints(10);
+   
+   hRSI = iRSI(_Symbol, _Period, 14, PRICE_CLOSE);
+   hMA  = iMA(_Symbol, InpMacroTF, InpMA_Period, 0, MODE_EMA, PRICE_CLOSE); 
+   hATR = iATR(_Symbol, _Period, InpATR_Period);
+   
+   if(hRSI==INVALID_HANDLE || hMA==INVALID_HANDLE || hATR==INVALID_HANDLE) return INIT_FAILED;
+   
+   InitNetwork(5, InpHiddenNeurons, 1);
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int r) { if(InpTrainMode) SaveNetwork(); }
+
+void OnTick() {
+   if(!ai_ready || !TerminalInfoInteger(TERMINAL_CONNECTED)) return;
+   
+   if(!PositionSelect(_Symbol)) {
+      HistorySelect(TimeCurrent()-86400, TimeCurrent());
+      int deals = HistoryDealsTotal();
+      if(deals > 0) {
+         ulong ticket = HistoryDealGetTicket(deals-1);
+         if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_OUT) {
+            datetime exit_time = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+            if(exit_time > last_trade_time) last_trade_time = exit_time; 
+         }
+      }
+   }
+
+   static datetime last_t = 0;
+   datetime curr_t = iTime(_Symbol, _Period, 0);
+   if(last_t == curr_t) return;
+   last_t = curr_t;
+   
+   double inputs[];
+   if(!GetFeatures(inputs)) return;
+   
+   if(InpTrainMode) {
+      double c = iClose(_Symbol, _Period, 1);
+      double o = iOpen(_Symbol, _Period, 1);
+      double target = (c > o) ? 0.8 : 0.2;
+      TrainDeep(inputs, target);
+      
+      double dummy[];
+      double check = Compute(inputs, dummy);
+      Comment("TREINANDO V22 (M15/H1)...\nOutput: ", DoubleToString(check,4));
+   }
+   else {
+      if(!IsTradingTime()) {
+         if(PositionSelect(_Symbol)) trade.PositionClose(_Symbol);
+         return;
+      }
+      
+      if((TimeCurrent() - last_trade_time) < (InpCooldownMins * 60)) {
+         Comment("COOLDOWN ATIVO.");
+         return;
+      }
+      
+      double hidden_dump[];
+      double pred = Compute(inputs, hidden_dump);
+      
+      double atr[]; CopyBuffer(hATR, 0, 1, 1, atr);
+      double vol = atr[0];
+      if(vol < 50) { Comment("VOLATILIDADE BAIXA PARA M15..."); return; } 
+      
+      int sl_pts = (int)(vol * InpRiskFactor);   
+      int tp_pts = (int)(vol * InpProfitFactor); 
+      if(sl_pts < 150) sl_pts = 150;
+      if(tp_pts < 300) tp_pts = 300;
+
+      string sinal = "NEUTRO";
+      
+      double c1 = iClose(_Symbol, _Period, 1);
+      double o1 = iOpen(_Symbol, _Period, 1);
+      
+      if(pred >= InpThreshold && c1 > o1) sinal = "COMPRA";
+      if(pred <= (1.0 - InpThreshold) && c1 < o1) sinal = "VENDA";
+      
+      Comment("IA V22 (M15): ", DoubleToString(pred, 4), 
+              "\nSinal: ", sinal, 
+              "\nSL Dinâmico: ", sl_pts, " pts");
+      
+      if(PositionSelect(_Symbol)) return; 
+
+      if(sinal == "COMPRA") {
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         trade.Buy(InpLots, _Symbol, ask, ask - sl_pts*_Point, ask + tp_pts*_Point, "AI V22 M15");
+      }
+      else if(sinal == "VENDA") {
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         trade.Sell(InpLots, _Symbol, bid, bid + sl_pts*_Point, bid - tp_pts*_Point, "AI V22 M15");
+      }
+   }
+}
